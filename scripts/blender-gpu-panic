@@ -1,0 +1,4 @@
+#!/bin/bash
+# Emergency cleanup: destroy every blender-gpu (bgpu-*) Vast.ai instance now.
+#   blender-gpu-panic [-y] [--all]     (--all = every instance on the account)
+exec "$(dirname "$(realpath "$0")")/blender-gpu" panic "$@"

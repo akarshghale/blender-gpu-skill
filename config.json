@@ -1,0 +1,35 @@
+{
+  "_comment": "Defaults for blender-gpu. Override per-user in ~/BlenderGPU/config.json (same keys).",
+
+  "provider": "vast",
+  "approval": "dialog",
+  "_approval_modes": "dialog = native macOS Rent/Don't-rent dialog a person must click (default); tty = type RENT in the terminal; flag = --approve alone (only if something else already asks the human)",
+
+  "blender_version": "5.2.2",
+  "blender_urls": [
+    "https://download.blender.org/release/Blender5.2/blender-5.2.2-linux-x64.tar.xz",
+    "https://mirrors.ocf.berkeley.edu/blender/release/Blender5.2/blender-5.2.2-linux-x64.tar.xz",
+    "https://ftp.halifax.rwth-aachen.de/blender/release/Blender5.2/blender-5.2.2-linux-x64.tar.xz"
+  ],
+  "blender_sha256": "84098912789dc450e95697c4184fb8a90acbe5111c2ba4aede3fecb57806a168",
+
+  "image": "vastai/base-image:@vastai-automatic-tag",
+  "disk_gb": 20,
+
+  "max_dph_total": 0.10,
+  "min_gpu_ram_gb": 12,
+  "min_cpu_ram_gb": 16,
+  "min_driver_version": "575.0",
+  "min_reliability": 0.95,
+  "min_inet_down_mbps": 200,
+  "max_inet_cost_per_tb": 20.0,
+  "candidates": 3,
+
+  "max_runtime_minutes": 120,
+  "download_reserve_minutes": 12,
+  "boot_timeout_minutes": 15,
+  "plan_valid_minutes": 30,
+
+  "ssh_private_key": "~/.ssh/id_ed25519",
+  "data_dir": "~/BlenderGPU"
+}

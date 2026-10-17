@@ -1,0 +1,1328 @@
+#!/usr/bin/env python3
+"""blender-gpu: on-demand Blender GPU rendering on a rented cloud GPU, controlled from this Mac.
+
+GPU marketplaces are reached only through providers/ (interface in
+providers/base.py; default provider "vast" = Vast.ai).
+
+The Mac holds every persistent file (~/BlenderGPU). Rented instances are
+disposable: provision -> upload -> bootstrap -> render -> download+verify ->
+destroy. Nothing is rented without `run --approve` AND a human approval
+(native macOS dialog by default; see "approval" in config.json).
+
+Works from any shell or agent harness. Add --json to any command for one
+machine-readable JSON object on stdout (progress goes to stderr).
+
+Commands (all free unless marked $):
+  doctor                     check CLI, API key, balance, SSH key, reaper
+  search                     list offers that meet the hardware/price policy
+  plan BLEND [options]       create a job + priced candidate offers (no rental)
+  run JOB --approve      $   rent an approved candidate and execute the job
+  status [JOB]               job state; live instances tagged bgpu-*
+  fetch JOB                  re-download + verify outputs from a live instance
+  destroy JOB                destroy the job's instance (after asking)
+  reap [--dry-run]           destroy bgpu-* instances older than the limit
+  panic [-y] [--all]         emergency: destroy every bgpu-* instance now
+  install-reaper / uninstall-reaper   manage the launchd runtime-limit agent
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+TOOL_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+REMOTE_DIR = os.path.join(TOOL_DIR, "remote")
+LABEL_PREFIX = "bgpu-"
+LAUNCHD_LABEL = "com.blender-gpu.reaper"
+
+sys.path.insert(0, TOOL_DIR)
+from providers import ProviderError, get_provider  # noqa: E402
+
+# Test hooks (used by tests/; never needed in normal use).
+SSH = os.environ.get("BGPU_SSH", "ssh")
+REMOTE_ROOT = os.environ.get("BGPU_REMOTE_ROOT", "/workspace/bgpu")
+POLL = float(os.environ.get("BGPU_POLL_SECONDS", "15"))
+
+
+class Fail(Exception):
+    """A job step failed; message is user-facing."""
+
+
+class Unverified(Fail):
+    """Outputs exist remotely but could not be downloaded intact."""
+
+
+# ---------------------------------------------------------------- config/state
+
+def load_config():
+    with open(os.path.join(TOOL_DIR, "config.json")) as f:
+        cfg = json.load(f)
+    data_dir = os.path.expanduser(os.environ.get("BGPU_DATA_DIR", cfg["data_dir"]))
+    user_cfg = os.path.join(data_dir, "config.json")
+    if os.path.exists(user_cfg):
+        with open(user_cfg) as f:
+            cfg.update(json.load(f))
+    cfg["data_dir"] = data_dir
+    cfg["ssh_private_key"] = os.path.expanduser(cfg["ssh_private_key"])
+    for sub in ("jobs", "state/active", "logs"):
+        os.makedirs(os.path.join(data_dir, sub), exist_ok=True)
+    return cfg
+
+
+def now():
+    return time.time()
+
+
+def iso(t=None):
+    return datetime.fromtimestamp(t or now(), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+class Job:
+    def __init__(self, cfg, job_id):
+        self.cfg = cfg
+        self.id = job_id
+        self.dir = os.path.join(cfg["data_dir"], "jobs", job_id)
+        self.path = os.path.join(self.dir, "job.json")
+        self.data = read_json(self.path)
+        if self.data is None:
+            raise Fail("no such job: %s (see `blender-gpu status`)" % job_id)
+        self.logf = open(os.path.join(self.dir, "logs", "controller.log"), "a")
+
+    def save(self):
+        write_json(self.path, self.data)
+
+    def log(self, msg, quiet=False):
+        line = "[%s] %s" % (iso(), msg)
+        self.logf.write(line + "\n")
+        self.logf.flush()
+        if not quiet:
+            print(line, flush=True)
+
+    def event(self, state, **kw):
+        self.data["state"] = state
+        self.data.setdefault("history", []).append(dict(t=iso(), state=state, **kw))
+        self.save()
+
+
+def active_path(cfg, instance_id):
+    return os.path.join(cfg["data_dir"], "state", "active", "%s.json" % instance_id)
+
+
+def reaper_log(cfg, msg):
+    line = "[%s] %s" % (iso(), msg)
+    print(line, flush=True)
+    with open(os.path.join(cfg["data_dir"], "logs", "reaper.log"), "a") as f:
+        f.write(line + "\n")
+
+
+# ---------------------------------------------------------------- provider
+
+class _Guarded:
+    """Wraps the provider so its errors surface as the controller's Fail."""
+
+    def __init__(self, provider):
+        self._p = provider
+
+    def __getattr__(self, name):
+        attr = getattr(self._p, name)
+        if not callable(attr):
+            return attr
+
+        def call(*a, **kw):
+            try:
+                return attr(*a, **kw)
+            except ProviderError as e:
+                raise Fail(str(e))
+        return call
+
+
+PROV = None  # set in main()
+RESULT = {}  # machine-readable result of the current command (--json)
+
+
+def result(**kw):
+    RESULT.update(kw)
+
+
+def list_instances():
+    return PROV.list_instances()
+
+
+def safe_list():
+    try:
+        return list_instances()
+    except Fail:
+        return []
+
+
+def get_instance(iid):
+    return PROV.get_instance(iid)
+
+
+def is_ours(cfg, inst):
+    return str(inst.get("label") or "").startswith(LABEL_PREFIX) or os.path.exists(active_path(cfg, inst["id"]))
+
+
+def destroy_instance(cfg, iid, reason, log=print):
+    """Destroy and confirm it is gone. Returns True when confirmed."""
+    for attempt in range(1, 6):
+        try:
+            PROV.destroy_instance(iid)
+        except Fail as e:
+            log("destroy attempt %d error: %s" % (attempt, e))
+        time.sleep(min(2 * attempt, 10) if POLL >= 1 else 0)
+        try:
+            inst = get_instance(iid)
+        except Fail as e:
+            log("could not confirm destroy (%s); retrying" % e)
+            continue
+        if inst is None:
+            log("instance %s destroyed (%s)" % (iid, reason))
+            for leftover in (active_path(cfg, iid),
+                             os.path.join(cfg["data_dir"], "state", "known_hosts.%s" % iid)):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+            return True
+        log("instance %s still listed (status=%s); retrying destroy" % (iid, inst["status"]))
+    log("WARNING: could not confirm instance %s is destroyed. Run `blender-gpu panic` "
+        "or destroy it at %s" % (iid, PROV.console_url or "the provider's console"))
+    return False
+
+
+# ---------------------------------------------------------------- offers
+
+def driver_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or "0"))[:3]) or (0,)
+
+
+def search_offers(cfg, disk_gb):
+    """Provider offers that satisfy the policy. The provider may pre-filter;
+    every limit is enforced again here on the normalized fields."""
+    keep = []
+    for o in PROV.search_offers(cfg, disk_gb):
+        why = []
+        if not o.get("nvidia"):
+            why.append("not NVIDIA")
+        if o.get("num_gpus", 1) != 1:
+            why.append("multi-GPU")
+        if float(o.get("dph_total") or 99) > cfg["max_dph_total"] + 1e-9:
+            why.append("price with %dGB disk > cap" % disk_gb)
+        if (o.get("vram_gb") or 0) < cfg["min_gpu_ram_gb"] - 0.5:
+            why.append("vram")
+        if (o.get("ram_gb") or 0) < cfg["min_cpu_ram_gb"] - 0.5:
+            why.append("ram")
+        if not o.get("verified"):
+            why.append("unverified")
+        if (o.get("reliability") or 0) < cfg["min_reliability"] - 1e-9:
+            why.append("reliability")
+        if driver_tuple(o.get("driver")) < driver_tuple(cfg["min_driver_version"]):
+            why.append("driver < %s (no OptiX in Blender 5.2)" % cfg["min_driver_version"])
+        if max(o.get("down_per_tb") or 0, o.get("up_per_tb") or 0) > cfg["max_inet_cost_per_tb"]:
+            why.append("bandwidth price")
+        if o.get("cpu_arch", "amd64") not in ("amd64", "x86_64"):
+            why.append("not x86_64")
+        if not why:
+            o = dict(o)
+            o["rt_cores"] = "RTX" in str(o.get("gpu")) or str(o.get("gpu")) in RT_DATACENTER
+            keep.append(o)
+    return keep
+
+
+# Non-"RTX"-named GPUs that still have RT cores (OptiX hardware ray tracing).
+RT_DATACENTER = {"Tesla T4", "T4", "L4", "L40", "L40S", "A10", "A10G", "A40"}
+
+
+def print_offers(rows):
+    print("%-10s %-18s %5s %5s %8s %-11s %5s %-22s %6s" % (
+        "offer", "gpu", "vram", "ram", "$/hr", "driver", "rel", "location", "down"))
+    for r in rows:
+        print("%-10s %-18s %5s %5s %8.4f %-11s %5.3f %-22s %6s" % (
+            r["offer_id"], (r["gpu"] or "")[:18], r["vram_gb"], r["ram_gb"], r["dph_total"],
+            (r["driver"] or "")[:11], r["reliability"], (r["location"] or "")[:22], r["inet_down_mbps"]))
+
+
+def rank(rows):
+    # Prefer RT cores (OptiX hardware ray tracing), then price, then reliability.
+    return sorted(rows, key=lambda r: (not r["rt_cores"], r["dph_total"], -r["reliability"]))
+
+
+# ---------------------------------------------------------------- local files
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+EXCLUDE_DIRS = {".git", "__pycache__", ".DS_Store", "node_modules"}
+EXCLUDE_RE = re.compile(r"(\.blend\d+$|^\._|^\.DS_Store$)")
+
+
+def collect_inputs(blend, project_dir, extra):
+    """Return {relative_path: absolute_path} for upload."""
+    files = {}
+    if project_dir:
+        for root, dirs, names in os.walk(project_dir):
+            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS and not d.startswith(".")]
+            for n in names:
+                if EXCLUDE_RE.search(n):
+                    continue
+                full = os.path.join(root, n)
+                files[os.path.relpath(full, project_dir)] = full
+        rel_blend = os.path.relpath(blend, project_dir)
+        if rel_blend.startswith(".."):
+            raise Fail("the .blend must be inside --project-dir")
+    else:
+        rel_blend = os.path.basename(blend)
+        files[rel_blend] = blend
+    for e in extra:
+        files.setdefault(os.path.join("_extra", os.path.basename(e)), e)
+    return rel_blend, files
+
+
+IMAGE_MAGIC = {
+    ".png": [b"\x89PNG\r\n\x1a\n"], ".jpg": [b"\xff\xd8\xff"], ".jpeg": [b"\xff\xd8\xff"],
+    ".exr": [b"\x76\x2f\x31\x01"], ".tif": [b"II*\x00", b"MM\x00*"], ".tiff": [b"II*\x00", b"MM\x00*"],
+    ".webp": [b"RIFF"], ".bmp": [b"BM"],
+}
+
+
+def manifest_paths(manifest_text):
+    return {os.path.normpath(m.group(1)) for m in re.finditer(r"^[0-9a-f]{64}\s+\*?(.+)$", manifest_text, re.M)}
+
+
+def drop_unlisted(stage_dir, manifest_text):
+    """Remove files that appeared after the manifest was written (never trust
+    unverified bytes). Returns their relative paths."""
+    listed, dropped = manifest_paths(manifest_text), []
+    for root, _, names in os.walk(stage_dir):
+        for n in names:
+            rel = os.path.normpath(os.path.relpath(os.path.join(root, n), stage_dir))
+            if rel not in listed:
+                os.remove(os.path.join(root, n))
+                dropped.append(rel)
+    return dropped
+
+
+def verify_download(stage_dir, manifest_text):
+    """Every manifest entry present with matching SHA-256 and sane image header;
+    no unexpected extra files. Returns (ok, problems, file_count, bytes)."""
+    problems, expected, total = [], {}, 0
+    for line in manifest_text.splitlines():
+        if not line.strip():
+            continue
+        m = re.match(r"^([0-9a-f]{64})\s+\*?(.+)$", line)
+        if not m:
+            problems.append("bad manifest line: %r" % line)
+            continue
+        expected[os.path.normpath(m.group(2))] = m.group(1)
+    for rel, digest in expected.items():
+        p = os.path.join(stage_dir, rel)
+        if not os.path.isfile(p):
+            problems.append("missing: %s" % rel)
+            continue
+        if sha256_file(p) != digest:
+            problems.append("checksum mismatch: %s" % rel)
+            continue
+        size = os.path.getsize(p)
+        total += size
+        ext = os.path.splitext(rel)[1].lower()
+        if ext in IMAGE_MAGIC:
+            with open(p, "rb") as f:
+                head = f.read(8)
+            if size == 0 or not any(head.startswith(mg) for mg in IMAGE_MAGIC[ext]):
+                problems.append("not a valid %s file: %s" % (ext, rel))
+    for root, _, names in os.walk(stage_dir):
+        for n in names:
+            rel = os.path.normpath(os.path.relpath(os.path.join(root, n), stage_dir))
+            if rel not in expected:
+                problems.append("unexpected file: %s" % rel)
+    return not problems, problems, len(expected), total
+
+
+# ---------------------------------------------------------------- remote (ssh)
+
+class Remote:
+    def __init__(self, job, host, port):
+        self.job, self.host, self.port = job, host, int(port)
+        self.kh = os.path.join(job.cfg["data_dir"], "state", "known_hosts.%s" % job.data["instance_id"])
+
+    def base(self):
+        return [SSH, "-T", "-p", str(self.port), "-i", self.job.cfg["ssh_private_key"],
+                "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=accept-new", "-o", "UserKnownHostsFile=" + self.kh,
+                "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+                "-o", "LogLevel=ERROR", "root@" + self.host]
+
+    def run(self, script, timeout=300, stdin=None, check=True, capture=True):
+        env = dict(os.environ, BGPU_REMOTE_ROOT=REMOTE_ROOT)
+        cmd = self.base() + ["export BGPU_REMOTE_ROOT=%s; %s" % (shlex.quote(REMOTE_ROOT), script)]
+        try:
+            p = subprocess.run(cmd, input=stdin, capture_output=capture, timeout=timeout, env=env)
+        except subprocess.TimeoutExpired:
+            raise Fail("remote command timed out after %ss: %s" % (timeout, script[:80]))
+        if check and p.returncode != 0:
+            err = (p.stderr or b"").decode(errors="replace")[-800:] if capture else ""
+            raise Fail("remote command failed (exit %d): %s\n%s" % (p.returncode, script[:80], err))
+        return p
+
+    def text(self, script, timeout=120):
+        return self.run(script, timeout=timeout).stdout.decode(errors="replace")
+
+    def put_files(self, files, dest, timeout=3600):
+        """Stream {rel: abs} into dest via tar over ssh."""
+        with tempfile.TemporaryDirectory() as tmp:
+            # Build a symlink farm so tar sees the final relative layout.
+            for rel, src in files.items():
+                link = os.path.join(tmp, rel)
+                os.makedirs(os.path.dirname(link), exist_ok=True)
+                os.symlink(os.path.abspath(src), link)
+            tar = subprocess.Popen(["tar", "-chf", "-", "--no-mac-metadata", "--no-xattrs", "-C", tmp, "."],
+                                   stdout=subprocess.PIPE, env=dict(os.environ, COPYFILE_DISABLE="1"))
+            cmd = self.base() + ["mkdir -p %s && tar -xf - -C %s --no-same-owner 2>&1 | grep -v 'Ignoring unknown extended header' >&2; exit ${PIPESTATUS[0]}" % (shlex.quote(dest), shlex.quote(dest))]
+            ssh = subprocess.Popen(cmd, stdin=tar.stdout, stderr=subprocess.PIPE,
+                                   env=dict(os.environ, BGPU_REMOTE_ROOT=REMOTE_ROOT))
+            tar.stdout.close()
+            try:
+                _, err = ssh.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                ssh.kill()
+                tar.kill()
+                raise Fail("upload timed out")
+            tar.wait()
+            if tar.returncode != 0 or ssh.returncode != 0:
+                raise Fail("upload failed: %s" % err.decode(errors="replace")[-500:])
+
+    def get_dir(self, src, local_dir, timeout=3600):
+        os.makedirs(local_dir, exist_ok=True)
+        ssh = subprocess.Popen(self.base() + ["tar -cf - -C %s ." % shlex.quote(src)],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               env=dict(os.environ, BGPU_REMOTE_ROOT=REMOTE_ROOT))
+        tar = subprocess.Popen(["tar", "-xf", "-", "-C", local_dir], stdin=ssh.stdout, stderr=subprocess.PIPE)
+        ssh.stdout.close()
+        try:
+            _, terr = tar.communicate(timeout=timeout)
+            ssh.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            ssh.kill()
+            tar.kill()
+            raise Fail("download timed out")
+        if ssh.returncode != 0 or tar.returncode != 0:
+            raise Fail("download failed: %s %s" % (ssh.stderr.read().decode(errors="replace")[-300:],
+                                                   terr.decode(errors="replace")[-300:]))
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_doctor(cfg, args):
+    ok = True
+
+    checks = []
+    result(checks=checks)
+
+    def item(good, text, hint=""):
+        nonlocal ok
+        ok = ok and good
+        checks.append({"ok": bool(good), "check": text, "hint": hint if not good else ""})
+        print(("  OK   " if good else "  FAIL ") + text + (("\n         -> " + hint) if hint and not good else ""))
+
+    print("blender-gpu doctor (provider: %s)" % PROV.name)
+    for good, text, hint in PROV.doctor_checks():
+        item(good, text, hint)
+    try:
+        acct = PROV.account()
+        item(True, "%s API key valid (account %s)" % (PROV.name, acct.get("id")))
+        need = cfg["max_dph_total"] * cfg["max_runtime_minutes"] / 60.0
+        item(acct["credit"] >= need, "credit $%.2f (worst-case job cost $%.2f)" % (acct["credit"], need),
+             "add credit with %s before running a job" % PROV.name)
+        pub = cfg["ssh_private_key"] + ".pub"
+        item(os.path.exists(pub) and PROV.ssh_key_registered(open(pub).read()),
+             "SSH key %s registered with %s" % (pub, PROV.name), "register %s with the provider" % pub)
+        insts = [i for i in list_instances() if is_ours(cfg, i)]
+        item(not insts, "no blender-gpu instances running (%d)" % len(insts), "blender-gpu status / blender-gpu panic")
+    except Fail as e:
+        item(False, "%s API reachable: %s" % (PROV.name, e), "check the provider API key")
+    p = subprocess.run(["ssh-keygen", "-y", "-P", "", "-f", cfg["ssh_private_key"]], capture_output=True)
+    item(p.returncode == 0, "SSH key usable without a passphrase prompt",
+         "use ssh-agent (ssh-add) or set ssh_private_key in ~/BlenderGPU/config.json")
+    plist = os.path.expanduser("~/Library/LaunchAgents/%s.plist" % LAUNCHD_LABEL)
+    loaded = subprocess.run(["launchctl", "list", LAUNCHD_LABEL], capture_output=True).returncode == 0
+    item(os.path.exists(plist) and loaded, "runtime-limit reaper (launchd) installed and loaded",
+         "blender-gpu install-reaper")
+    last = os.path.join(cfg["data_dir"], "logs", "reaper.heartbeat")
+    if os.path.exists(last):
+        age = now() - os.path.getmtime(last)
+        item(age < 900, "reaper last ran %.0f s ago" % age, "launchctl kickstart gui/%d/%s" % (os.getuid(), LAUNCHD_LABEL))
+    print("all good" if ok else "some checks failed")
+    return 0 if ok else 1
+
+
+def cmd_search(cfg, args):
+    rows = rank(search_offers(cfg, args.disk or cfg["disk_gb"]))
+    result(provider=PROV.name, offers=rows[: args.limit], total=len(rows))
+    print("%d offers meet policy: NVIDIA, verified, >=%dGB VRAM, >=%dGB RAM, <=$%.2f/hr incl. %dGB disk, driver>=%s" % (
+        len(rows), cfg["min_gpu_ram_gb"], cfg["min_cpu_ram_gb"], cfg["max_dph_total"],
+        args.disk or cfg["disk_gb"], cfg["min_driver_version"]))
+    print_offers(rows[: args.limit])
+    return 0
+
+
+def cmd_plan(cfg, args):
+    blend = os.path.abspath(os.path.expanduser(args.blend))
+    if not os.path.isfile(blend) or not blend.endswith(".blend"):
+        raise Fail("not a .blend file: %s" % blend)
+    with open(blend, "rb") as f:
+        head = f.read(12)
+    if not (head.startswith(b"BLENDER") or head[:2] == b"\x1f\x8b" or head[:4] == b"\x28\xb5\x2f\xfd"):
+        raise Fail("%s does not look like a Blender file" % blend)
+    project = os.path.abspath(os.path.expanduser(args.project_dir)) if args.project_dir else None
+    extra = []
+    if args.script:
+        extra.append(os.path.abspath(os.path.expanduser(args.script)))
+        if not os.path.isfile(extra[0]):
+            raise Fail("script not found: %s" % extra[0])
+    rel_blend, files = collect_inputs(blend, project, extra)
+    total = sum(os.path.getsize(p) for p in files.values())
+    if total > args.max_upload_gb * 1e9:
+        raise Fail("upload would be %.1f GB (> --max-upload-gb %s)" % (total / 1e9, args.max_upload_gb))
+    disk = args.disk or max(cfg["disk_gb"], int(total * 3 / 1e9) + 12)
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", os.path.splitext(os.path.basename(blend))[0]).strip("-")[:24] or "job"
+    job_id = "%s-%s" % (stamp, slug)
+    jdir = os.path.join(cfg["data_dir"], "jobs", job_id)
+    os.makedirs(os.path.join(jdir, "logs"))
+
+    spec = {
+        "mode": args.mode, "frames": args.frames, "format": args.format, "samples": args.samples,
+        "resolution_percent": args.resolution_percent, "scene": args.scene, "camera": args.camera,
+        "device": args.device, "require_gpu": not args.allow_cpu, "fail_on_missing": not args.allow_missing,
+        "engine": "CYCLES", "output_name": args.output_name,
+        "user_script": ("_extra/" + os.path.basename(extra[0])) if extra else None,
+    }
+    rows = rank(search_offers(cfg, disk))
+    cands = rows[: cfg["candidates"]]
+    limit_min = min(args.max_minutes or cfg["max_runtime_minutes"], cfg["max_runtime_minutes"])
+    job = {
+        "id": job_id, "created": iso(), "state": "planned", "blend": blend, "project_dir": project,
+        "blend_rel": rel_blend, "inputs": {rel: {"path": p, "size": os.path.getsize(p)} for rel, p in files.items()},
+        "upload_bytes": total, "disk_gb": disk, "spec": spec, "autoexec": bool(args.autoexec),
+        "blender": {"version": cfg["blender_version"], "sha256": cfg["blender_sha256"], "urls": cfg["blender_urls"]},
+        "provider": PROV.name, "image": cfg["image"], "candidates": cands, "plan_expires": now() + cfg["plan_valid_minutes"] * 60,
+        "max_runtime_minutes": limit_min, "max_dph_total": cfg["max_dph_total"],
+        "worst_case_cost": round((cands[0]["dph_total"] if cands else cfg["max_dph_total"]) * limit_min / 60.0, 3),
+        "history": [{"t": iso(), "state": "planned"}],
+    }
+    write_json(os.path.join(jdir, "job.json"), job)
+    result(job_id=job_id, state=job["state"], provider=PROV.name, candidates=cands,
+           worst_case_cost=job["worst_case_cost"], max_runtime_minutes=limit_min, upload_bytes=total,
+           disk_gb=disk, plan_expires=iso(job["plan_expires"]), approval_mode=cfg.get("approval", "dialog"),
+           run_command="blender-gpu run %s --approve --detach" % job_id)
+
+    print("JOB %s" % job_id)
+    print("  blend      %s%s" % (blend, ("  (project dir %s)" % project) if project else ""))
+    print("  upload     %d file(s), %.1f MB   disk %d GB" % (len(files), total / 1e6, disk))
+    print("  render     mode=%s frames=%s format=%s device=%s%s" % (
+        args.mode, args.frames or "current", args.format, args.device, " samples=%s" % args.samples if args.samples else ""))
+    print("  blender    %s (sha256 verified on instance)   image %s" % (cfg["blender_version"], cfg["image"]))
+    print("  limit      %d min hard runtime limit (instance watchdog + launchd reaper)" % limit_min)
+    if not cands:
+        print("\nNo offers currently meet the policy. Nothing will be rented. Try again later.")
+        job["state"] = "no_offers"
+        write_json(os.path.join(jdir, "job.json"), job)
+        result(state="no_offers", run_command=None)
+        return 3
+    print("\n  Candidate offers (the approval covers these, tried in order, all <= $%.2f/hr):" % cfg["max_dph_total"])
+    print_offers(cands)
+    print("\n  Worst-case cost: $%.3f (first candidate for the full %d min) + bandwidth (~$%.4f)" % (
+        job["worst_case_cost"], limit_min, (total / 1e12) * max(c["up_per_tb"] for c in cands) + 0.4 / 1e3 * max(c["down_per_tb"] for c in cands)))
+    print("  Plan valid for %d min. Nothing has been rented." % cfg["plan_valid_minutes"])
+    print("\n  To rent and run (PAID):  blender-gpu run %s --approve" % job_id)
+    return 0
+
+
+def preflight(cfg, job):
+    if job.data.get("provider", PROV.name) != PROV.name:
+        raise Fail("job was planned with provider %r but %r is configured; re-run plan" % (job.data["provider"], PROV.name))
+    credit = PROV.account()["credit"]
+    if credit < job.data["worst_case_cost"]:
+        raise Fail("%s credit is $%.2f, below this job's worst-case cost $%.2f. Add credit first. "
+                   "Nothing was rented." % (PROV.name, credit, job.data["worst_case_cost"]))
+    pub = cfg["ssh_private_key"] + ".pub"
+    if not os.path.exists(pub):
+        raise Fail("SSH public key %s missing" % pub)
+    if not PROV.ssh_key_registered(open(pub).read()):
+        raise Fail("SSH key %s is not registered with %s" % (pub, PROV.name))
+    for rel, meta in job.data["inputs"].items():
+        if not os.path.isfile(meta["path"]):
+            raise Fail("input changed since planning (missing %s); re-run plan" % meta["path"])
+
+
+def wait_running(cfg, job, iid):
+    deadline = now() + cfg["boot_timeout_minutes"] * 60
+    last = None
+    while now() < deadline:
+        inst = get_instance(iid)
+        if inst is None:
+            raise Fail("instance %s disappeared while starting" % iid)
+        st = inst["status"]
+        if (st, inst.get("status_detail")) != last:
+            job.log("instance %s status: %s (%s)" % (iid, st, (inst.get("status_detail") or "")[:120]))
+            last = (st, inst.get("status_detail"))
+        if st == "running":
+            return inst
+        if st in ("failed", "stopped"):
+            raise Fail("instance %s entered status %r: %s" % (iid, st, inst.get("status_detail")))
+        time.sleep(POLL)
+    raise Fail("instance %s not running after %d min" % (iid, cfg["boot_timeout_minutes"]))
+
+
+def ssh_endpoint(iid, inst):
+    return PROV.ssh_endpoint(inst)
+
+
+def onstart_script(deadline):
+    with open(os.path.join(REMOTE_DIR, "onstart.sh")) as f:
+        script = f.read()
+    return script.replace("__DEADLINE__", str(int(deadline))).replace("__PROVIDER_HOOKS__", PROV.watchdog_hooks().strip())
+
+
+def provision(cfg, job):
+    """Try approved candidates in order. Returns (instance_id, inst)."""
+    live = {o["offer_id"]: o for o in search_offers(cfg, job.data["disk_gb"])}
+    tried = []
+    for cand in job.data["candidates"]:
+        oid = cand["offer_id"]
+        o = live.get(oid)
+        if o is None:
+            job.log("offer %s no longer available" % oid)
+            tried.append(oid)
+            continue
+        price = float(o["dph_total"])
+        if price > cfg["max_dph_total"] + 1e-9 or price > cand["dph_total"] * 1.05 + 1e-9:
+            job.log("offer %s price changed to $%.4f/hr; skipping" % (oid, price))
+            continue
+        label = LABEL_PREFIX + job.id
+        created_at = now()
+        deadline = created_at + job.data["max_runtime_minutes"] * 60
+        # OptiX needs the driver's graphics libraries (libnvoptix) in the container.
+        env = {"NVIDIA_DRIVER_CAPABILITIES": "all", "NVIDIA_VISIBLE_DEVICES": "all", "BGPU_JOB": job.id}
+        job.log("renting offer %s (%s, $%.4f/hr) on %s ..." % (oid, cand["gpu"], price, PROV.name))
+        try:
+            iid = PROV.create_instance(oid, job.data["image"], job.data["disk_gb"], label, env,
+                                       onstart_script(deadline))
+        except Fail as e:
+            job.log("create failed for offer %s: %s" % (oid, e))
+            # A timed-out create may still have rented something: look it up by label.
+            stray = [i for i in safe_list() if i.get("label") == label]
+            for i in stray:
+                job.log("found instance %s from the failed create; destroying it" % i["id"])
+                write_json(active_path(cfg, i["id"]), {"instance_id": i["id"], "job": job.id, "label": label,
+                                                       "created": created_at, "deadline": deadline})
+                destroy_instance(cfg, i["id"], "orphan of failed create", job.log)
+            continue
+        # Record immediately so the reaper/panic can find it even if we crash.
+        write_json(active_path(cfg, iid), {"instance_id": iid, "job": job.id, "label": label,
+                                           "created": created_at, "deadline": deadline, "pid": os.getpid(),
+                                           "offer": cand})
+        job.data.update(instance_id=iid, offer=cand, instance_created=created_at, deadline=deadline)
+        job.event("provisioning", instance_id=iid, offer_id=oid, dph=price)
+        try:
+            inst = wait_running(cfg, job, iid)
+            return iid, inst
+        except Fail as e:
+            job.log("startup failed: %s; destroying and trying next candidate" % e)
+            destroy_instance(cfg, iid, "failed to start", job.log)
+            job.data["instance_id"] = None
+            job.save()
+    raise Fail("none of the approved offers could be started (%s). Re-run `plan` for fresh offers." %
+               ", ".join(str(c["offer_id"]) for c in job.data["candidates"]))
+
+
+def remote_wait_ssh(job, r, timeout=300):
+    end = now() + timeout
+    while True:
+        try:
+            r.run("true", timeout=40)
+            return
+        except Fail as e:
+            if now() > end:
+                raise Fail("SSH never became reachable: %s" % e)
+            time.sleep(min(POLL, 10))
+
+
+def stage_upload(job, r):
+    jroot = REMOTE_ROOT + "/job"
+    files = {"bin/" + n: os.path.join(REMOTE_DIR, n) for n in ("bootstrap.sh", "render.py", "run_job.sh")}
+    r.put_files(files, REMOTE_ROOT, timeout=600)
+    r.run("mv %s/bin/* %s/ && rmdir %s/bin" % ((REMOTE_ROOT,) * 3))
+    inputs = {rel: m["path"] for rel, m in job.data["inputs"].items()}
+    job.log("uploading %d input file(s), %.1f MB" % (len(inputs), job.data["upload_bytes"] / 1e6))
+    t0 = now()
+    r.put_files(inputs, jroot + "/input", timeout=3600)
+    # Verify the upload byte-for-byte before spending GPU time.
+    local = "".join("%s  ./%s\n" % (sha256_file(p), rel) for rel, p in sorted(inputs.items()))
+    with open(os.path.join(job.dir, "logs", "upload.sha256"), "w") as f:
+        f.write(local)
+    p = r.run("cd %s/input && (command -v sha256sum >/dev/null && sha256sum -c --quiet - || shasum -a 256 -c --quiet -)" % jroot,
+              stdin=local.encode(), check=False)
+    if p.returncode != 0:
+        raise Fail("uploaded inputs failed checksum verification: %s" % (p.stdout + p.stderr).decode(errors="replace")[-400:])
+    job.log("upload verified (%.0fs)" % (now() - t0))
+    spec = dict(job.data["spec"])
+    spec["output_dir"] = jroot + "/output"
+    spec["report_path"] = jroot + "/logs/render_report.json"
+    if spec.get("user_script"):
+        spec["user_script"] = jroot + "/input/" + spec["user_script"]
+    r.run("mkdir -p %s/output %s/logs && cat > %s/spec.json && printf %%s %s > %s/blend_rel %s" % (
+        jroot, jroot, jroot, shlex.quote(job.data["blend_rel"]), jroot,
+        ("&& touch %s/autoexec" % jroot) if job.data.get("autoexec") else ""), stdin=json.dumps(spec).encode())
+
+
+def bootstrap(job, r):
+    b = job.data["blender"]
+    job.log("bootstrapping Blender %s on instance" % b["version"])
+    p = r.run("bash %s/bootstrap.sh %s %s %s > %s/status/bootstrap.log 2>&1; rc=$?; tail -n 15 %s/status/bootstrap.log; exit $rc" % (
+        REMOTE_ROOT, shlex.quote(b["version"]), b["sha256"], " ".join(shlex.quote(u) for u in b["urls"]),
+        REMOTE_ROOT, REMOTE_ROOT), timeout=1500, check=False)
+    out = p.stdout.decode(errors="replace")
+    for line in out.splitlines():
+        job.log("  " + line, quiet=not line.startswith(("probe", "[bootstrap")))
+    if p.returncode != 0:
+        msg = {10: "apt-get failed", 11: "Blender download/checksum failed", 12: "extract failed",
+               13: "Blender would not start", 14: "no OptiX/CUDA device visible to Blender"}.get(p.returncode, "exit %d" % p.returncode)
+        raise Fail("bootstrap failed: %s" % msg)
+    probe = r.text("cat %s/status/gpu_probe.json 2>/dev/null || echo {}" % REMOTE_ROOT)
+    job.data["gpu_probe"] = json.loads(probe or "{}")
+    job.save()
+
+
+def execute(cfg, job, r):
+    budget = int(job.data["deadline"] - now() - cfg["download_reserve_minutes"] * 60)
+    if budget < 120:
+        raise Fail("not enough time left before the runtime limit to render")
+    job.event("rendering", budget_seconds=budget)
+    job.log("starting render (budget %d min before forced stop)" % (budget // 60))
+    r.run("cd %s && (command -v setsid >/dev/null && S=setsid; nohup $S bash run_job.sh %d </dev/null >job/logs/run_job.log 2>&1 &) ; sleep 1; cat job/state" % (
+        REMOTE_ROOT, budget), timeout=60)
+    seen, ssh_fail = [], 0
+    while True:
+        time.sleep(POLL)
+        try:
+            st = r.text("cd %s/job; cat state 2>/dev/null; echo ---; cat exit_code 2>/dev/null; echo ---; "
+                        "tail -c 20000 logs/blender.log 2>/dev/null | grep -a '^\\[bgpu\\]' | tail -n 50" % REMOTE_ROOT, timeout=60)
+            ssh_fail = 0
+        except Fail as e:
+            ssh_fail += 1
+            job.log("poll failed (%d): %s" % (ssh_fail, str(e)[:120]))
+            if ssh_fail >= 8:
+                raise Fail("lost contact with instance during render")
+            continue
+        parts = st.split("---\n")
+        lines = parts[2].splitlines() if len(parts) > 2 else []
+        for line in [l for l in lines if l not in seen][-10:]:
+            job.log("  " + line)
+        seen = lines
+        if parts[0].strip() == "done":
+            return int((parts[1].strip() or "1").splitlines()[0])
+        if now() > job.data["deadline"] - 60:
+            raise Fail("runtime limit reached during render")
+
+
+def stop_remote_render(job, r):
+    """Stop a still-running render so its outputs stop changing."""
+    p = r.run("cd %s; [ \"$(cat job/state 2>/dev/null)\" = running ] || exit 0; pid=$(cat status/render.pid 2>/dev/null); "
+              "[ -n \"$pid\" ] && kill -TERM $pid 2>/dev/null; for i in $(seq 40); do "
+              "[ \"$(cat job/state)\" = done ] && break; sleep 1; [ $i = 20 ] && kill -KILL $pid 2>/dev/null; done; "
+              "rm -f job/MANIFEST.sha256; echo stopped" % REMOTE_ROOT, check=False, timeout=90)
+    if b"stopped" in p.stdout:
+        job.log("stopped the remote render before salvaging outputs")
+
+
+def download(cfg, job, r, attempts=3, salvage=False):
+    """Download output + logs, verify against remote manifest. Returns summary.
+    Only a fully verified download is moved into jobs/<id>/output."""
+    jroot = REMOTE_ROOT + "/job"
+    final = os.path.join(job.dir, "output")
+    if salvage:
+        stop_remote_render(job, r)
+    # Logs first (best effort, never block cleanup on them).
+    try:
+        logs = os.path.join(job.dir, "logs", "remote")
+        shutil.rmtree(logs, ignore_errors=True)
+        r.get_dir(jroot + "/logs", logs, timeout=300)
+        for n in ("bootstrap.log", "probe.log", "nvidia-smi.txt", "gpu_probe.json"):
+            p = r.run("cat %s/status/%s" % (REMOTE_ROOT, n), check=False, timeout=60)
+            if p.returncode == 0:
+                with open(os.path.join(logs, n), "wb") as f:
+                    f.write(p.stdout)
+        p = r.run("cat %s/watchdog.log" % REMOTE_ROOT, check=False, timeout=60)
+        with open(os.path.join(logs, "watchdog.log"), "wb") as f:
+            f.write(p.stdout)
+    except Fail as e:
+        job.log("log download failed (continuing): %s" % e)
+    r.run("cd %s && if [ ! -f MANIFEST.sha256 ]; then (cd output && find . -type f ! -name '.*.partial*' | LC_ALL=C sort | "
+          "while IFS= read -r f; do (command -v sha256sum >/dev/null && sha256sum \"$f\" || shasum -a 256 \"$f\"); done) > MANIFEST.sha256; fi" % jroot,
+          timeout=600)
+    manifest = r.text("cat %s/MANIFEST.sha256" % jroot)
+    last = None
+    for i in range(1, attempts + 1):
+        stage = os.path.join(job.dir, "output.partial")
+        shutil.rmtree(stage, ignore_errors=True)
+        try:
+            t0 = now()
+            r.get_dir(jroot + "/output", stage)
+            for root, _, names in os.walk(stage):  # drop in-progress frames
+                for n in names:
+                    if ".partial" in n and n.startswith("."):
+                        os.remove(os.path.join(root, n))
+            extras = drop_unlisted(stage, manifest)
+            if extras:
+                job.log("ignoring %d file(s) not in the manifest: %s" % (len(extras), ", ".join(extras[:5])))
+            ok, problems, count, size = verify_download(stage, manifest)
+        except Fail as e:
+            ok, problems, count, size = False, [str(e)], 0, 0
+        if ok:
+            if os.path.exists(final):
+                # Merge with earlier verified outputs (e.g. a previous fetch).
+                for root, _, names in os.walk(stage):
+                    for n in names:
+                        src = os.path.join(root, n)
+                        dst = os.path.join(final, os.path.relpath(src, stage))
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        os.replace(src, dst)
+                shutil.rmtree(stage)
+            else:
+                os.replace(stage, final)
+            with open(os.path.join(job.dir, "MANIFEST.sha256"), "w") as f:
+                f.write(manifest)
+            job.log("downloaded and verified %d file(s), %.1f MB in %.0fs" % (count, size / 1e6, now() - t0))
+            return {"files": count, "bytes": size}
+        last = problems
+        job.log("download attempt %d failed verification: %s" % (i, "; ".join(problems[:5])))
+        time.sleep(min(POLL, 5))
+    raise Unverified("outputs could not be downloaded intact after %d attempts: %s" % (attempts, "; ".join(last[:5])))
+
+
+def report(job):
+    rr = read_json(os.path.join(job.dir, "logs", "remote", "render_report.json"), {}) or {}
+    frames = rr.get("frames", [])
+    ok = [f for f in frames if f.get("status") in ("ok", "skipped_existing")]
+    bad = [f for f in frames if f.get("status") == "failed"]
+    dev = rr.get("device", {})
+    secs = sum(f.get("seconds", 0) for f in frames)
+    t0, t1 = job.data.get("instance_created"), job.data.get("destroyed_at")
+    cost = None
+    if t0 and t1 and job.data.get("offer"):
+        cost = (t1 - t0) / 3600.0 * job.data["offer"]["dph_total"]
+    out = {"frames_ok": len(ok), "frames_failed": [f["frame"] for f in bad], "device": dev,
+           "render_seconds": round(secs, 1), "blender": rr.get("blender"),
+           "instance_minutes": round((t1 - t0) / 60.0, 1) if t0 and t1 else None,
+           "est_cost_usd": round(cost, 4) if cost is not None else None}
+    job.data["result"] = out
+    job.save()
+    return out
+
+
+APPROVAL_MODES = ("dialog", "tty", "flag")
+
+
+def approval_text(cfg, job):
+    d = job.data
+    c = d["candidates"]
+    return ("Rent a GPU for blender-gpu job %s?\n\n"
+            "%s at $%.4f/hr%s\n"
+            "Hard runtime limit: %d min\n"
+            "Worst-case cost: $%.3f (+ small bandwidth fees)\n\n"
+            "%s" % (d["id"], c[0]["gpu"], c[0]["dph_total"],
+                    (" (or %d fallback offer(s) up to $%.4f/hr)" % (len(c) - 1, max(x["dph_total"] for x in c)))
+                    if len(c) > 1 else "",
+                    d["max_runtime_minutes"], d["worst_case_cost"],
+                    os.path.basename(d["blend"])))
+
+
+def _ask_dialog(text):
+    """Native macOS dialog; True only if a person clicks Rent within 10 min."""
+    script = ['-e', 'on run argv',
+              '-e', 'set r to display dialog (item 1 of argv) with title "blender-gpu: paid GPU rental" '
+                    'buttons {"Don\'t rent", "Rent"} default button "Don\'t rent" cancel button "Don\'t rent" '
+                    'with icon caution giving up after 600',
+              '-e', 'if gave up of r then return "timeout"',
+              '-e', 'return button returned of r',
+              '-e', 'end run']
+    try:
+        p = subprocess.run(["osascript"] + script + [text], capture_output=True, text=True, timeout=660)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Fail("could not show the approval dialog (%s); set \"approval\": \"tty\" in "
+                   "~/BlenderGPU/config.json to approve in a terminal instead" % e)
+    if p.returncode != 0 and "User canceled" not in p.stderr and "-128" not in p.stderr:
+        raise Fail("approval dialog failed (%s); set \"approval\": \"tty\" in ~/BlenderGPU/config.json "
+                   "to approve in a terminal instead" % p.stderr.strip()[:200])
+    return p.stdout.strip() == "Rent"
+
+
+def _ask_tty(text):
+    """Typed confirmation on the controlling terminal (not stdin, so a
+    harness piping input cannot answer it)."""
+    try:
+        tty = open("/dev/tty", "r+")
+    except OSError:
+        raise Fail("approval mode is \"tty\" but there is no terminal; run this command yourself in a terminal")
+    with tty:
+        tty.write("\n" + text + "\n\nType RENT to approve: ")
+        tty.flush()
+        return tty.readline().strip() == "RENT"
+
+
+def human_approval(cfg, job):
+    """The rental gate that does not depend on the calling harness. Only
+    config files choose the mode; there is deliberately no env override."""
+    mode = cfg.get("approval", "dialog")
+    if mode not in APPROVAL_MODES:
+        raise Fail("config approval=%r; expected one of %s" % (mode, ", ".join(APPROVAL_MODES)))
+    if mode == "flag":
+        return "flag"
+    print("waiting for human approval (%s) ..." % mode, file=sys.stderr, flush=True)
+    ok = _ask_dialog(approval_text(cfg, job)) if mode == "dialog" else _ask_tty(approval_text(cfg, job))
+    if not ok:
+        job.event("declined", via=mode)
+        raise Fail("rental not approved (%s). Nothing was rented." % mode)
+    return mode
+
+
+def cmd_run(cfg, args):
+    job = Job(cfg, args.job)
+    d = job.data
+    if not args.approve:
+        result(job_id=job.id, state=d["state"], error="--approve required")
+        print("Refusing to rent: `run` requires --approve (this creates a PAID instance).")
+        print("Review the plan with `blender-gpu status %s` first." % job.id)
+        return 2
+    if d["state"] not in ("planned",):
+        raise Fail("job is in state %r; only a freshly planned job can be run (re-run plan)" % d["state"])
+    if now() > d["plan_expires"]:
+        raise Fail("plan expired; re-run `blender-gpu plan` to get fresh prices")
+    if not d["candidates"]:
+        raise Fail("plan has no candidate offers")
+    preflight(cfg, job)
+    # A detached child inherits the parent's approval through a one-time nonce
+    # (only its hash is stored), so it does not ask the human twice.
+    nonce = os.environ.pop("BGPU_APPROVAL_NONCE", None)
+    pending = d.get("approval") or {}
+    if nonce and pending.get("nonce_sha256") == hashlib.sha256(nonce.encode()).hexdigest() \
+            and not pending.get("used") and now() - pending.get("at", 0) < 300:
+        via = pending["via"]
+        pending["used"] = True
+    else:
+        via = human_approval(cfg, job)
+    job.data["approval"] = {"via": via, "at": now()}
+    if args.detach:
+        # Run in a new session so the job (and its cleanup) survives the
+        # terminal or agent session that started it.
+        token = hashlib.sha256(os.urandom(32)).hexdigest()
+        job.data["approval"]["nonce_sha256"] = hashlib.sha256(token.encode()).hexdigest()
+        job.save()
+        out = open(os.path.join(job.dir, "logs", "run.out"), "a")
+        child = subprocess.Popen([sys.executable, os.path.realpath(__file__), "run", job.id, "--approve"],
+                                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                 start_new_session=True, env=dict(os.environ, BGPU_APPROVAL_NONCE=token))
+        print("job %s started in background (pid %d)\n  follow: tail -f %s\n  state:  blender-gpu status %s" % (
+            job.id, child.pid, out.name, job.id))
+        result(job_id=job.id, state="started", pid=child.pid, log=out.name, approved_via=via)
+        return 0
+    job.data["pid"] = os.getpid()
+    job.event("approved", via=via)
+
+    iid, r = None, None
+    interrupted = {"sig": None}
+
+    def on_signal(signum, frame):
+        interrupted["sig"] = signum
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGHUP, on_signal)
+    rc_final = 1
+    keep = False
+    try:
+        iid, inst = provision(cfg, job)
+        host, port = ssh_endpoint(iid, inst)
+        r = Remote(job, host, port)
+        job.log("instance %s running at %s:%s" % (iid, host, port))
+        remote_wait_ssh(job, r)
+        armed = r.run("cat %s/deadline 2>/dev/null && pgrep -f watchdog.sh >/dev/null && echo armed" % REMOTE_ROOT, check=False).stdout.decode()
+        job.log("on-instance watchdog: %s" % ("armed, deadline " + iso(int(armed.split()[0])) if "armed" in armed else "NOT confirmed (launchd reaper still enforces the limit)"))
+        job.event("uploading")
+        stage_upload(job, r)
+        bootstrap(job, r)
+        rc = execute(cfg, job, r)
+        job.log("render finished with exit code %d" % rc)
+        job.event("downloading", render_exit=rc)
+        summary = download(cfg, job, r)
+        job.data["download"] = summary
+        if rc == 0 and (summary["files"] or job.data["spec"]["mode"] == "script"):
+            rc_final, state = 0, "verified"
+        elif summary["files"]:
+            rc_final, state = 3, "partial"
+        else:
+            rc_final, state = 1, "failed"
+            job.log("render produced no output files (exit %d); see logs/remote/blender.log" % rc)
+        job.event(state, render_exit=rc)
+    except KeyboardInterrupt:
+        job.log("interrupted (%s); salvaging outputs then cleaning up" % (interrupted["sig"] or "Ctrl-C"))
+        signal.signal(signal.SIGINT, signal.SIG_IGN)  # don't let a 2nd Ctrl-C skip cleanup
+        if r is not None:
+            try:
+                download(cfg, job, r, attempts=2, salvage=True)
+            except Unverified as e:
+                job.log("salvage failed verification: %s" % e)
+                keep = True
+            except Exception as e:
+                job.log("salvage failed: %s" % e)
+        job.event("interrupted")
+        rc_final = 130
+    except Fail as e:
+        job.log("ERROR: %s" % e)
+        if isinstance(e, Unverified):
+            keep = True  # never destroy unverified outputs; the runtime limit still applies
+        elif r is not None:
+            # Salvage whatever finished, plus logs, before destroying.
+            try:
+                download(cfg, job, r, attempts=2, salvage=True)
+            except Unverified as e2:
+                job.log("partial outputs exist but failed verification: %s" % e2)
+                keep = True
+            except Exception as e2:
+                job.log("no outputs salvaged: %s" % e2)
+        job.event("failed", error=str(e))
+        rc_final = 1
+    except Exception as e:  # programming error: still clean up
+        job.log("UNEXPECTED ERROR: %r" % e)
+        job.event("failed", error=repr(e))
+        rc_final = 1
+    finally:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        if iid and job.data.get("instance_id"):
+            if keep:
+                job.data["state_before_attention"] = job.data["state"]
+                job.event("needs_attention", instance_id=iid)
+                print("\nInstance %s was KEPT because outputs could not be verified. It will be destroyed "
+                      "automatically at %s (runtime limit).\n  retry download: blender-gpu fetch %s\n"
+                      "  give up now:    blender-gpu destroy %s" % (iid, iso(job.data["deadline"]), job.id, job.id))
+                rc_final = 4
+            else:
+                gone = destroy_instance(cfg, iid, "job finished", job.log)
+                job.data["destroyed_at"] = now()
+                job.data["destroy_confirmed"] = gone
+                job.save()
+                if not gone:
+                    rc_final = rc_final or 5
+    res = report(job)
+    result(job_id=job.id, state=job.data["state"], instance_id=job.data.get("instance_id"),
+           destroy_confirmed=job.data.get("destroy_confirmed"), output_dir=os.path.join(job.dir, "output"),
+           logs_dir=os.path.join(job.dir, "logs"), summary=res)
+    print("\nRESULT %s: %s" % (job.id, job.data["state"]))
+    print("  outputs  %s" % os.path.join(job.dir, "output"))
+    print("  logs     %s" % os.path.join(job.dir, "logs"))
+    print("  summary  %s" % json.dumps(res))
+    return rc_final
+
+
+def cmd_fetch(cfg, args):
+    job = Job(cfg, args.job)
+    iid = job.data.get("instance_id")
+    inst = get_instance(iid) if iid else None
+    if not inst:
+        raise Fail("job has no live instance")
+    host, port = ssh_endpoint(iid, inst)
+    r = Remote(job, host, port)
+    job.data["download"] = download(cfg, job, r)
+    job.event("verified_fetch")
+    result(job_id=job.id, download=job.data["download"], output_dir=os.path.join(job.dir, "output"))
+    if args.destroy:
+        job.data["destroy_confirmed"] = destroy_instance(cfg, iid, "fetched", job.log)
+        job.data["destroyed_at"] = now()
+        job.save()
+        result(destroy_confirmed=job.data["destroy_confirmed"])
+    return 0
+
+
+def cmd_destroy(cfg, args):
+    job = Job(cfg, args.job)
+    iid = job.data.get("instance_id")
+    if not iid:
+        print("job has no instance")
+        return 0
+    if not args.yes and sys.stdin.isatty():
+        if input("Destroy instance %s (unverified outputs will be lost)? [y/N] " % iid).strip().lower() != "y":
+            return 1
+    ok = destroy_instance(cfg, iid, "manual destroy", job.log)
+    job.data["destroyed_at"] = now()
+    job.data["destroy_confirmed"] = ok
+    job.event("destroyed")
+    result(job_id=job.id, instance_id=iid, destroy_confirmed=ok)
+    return 0 if ok else 5
+
+
+def cmd_status(cfg, args):
+    if args.job:
+        job = Job(cfg, args.job)
+        d = dict(job.data)
+        d.pop("inputs", None)
+        d.get("approval", {}).pop("nonce_sha256", None)
+        result(job=d, output_dir=os.path.join(job.dir, "output"), logs_dir=os.path.join(job.dir, "logs"))
+        print(json.dumps(d, indent=2, default=str))
+        return 0
+    jobs_dir = os.path.join(cfg["data_dir"], "jobs")
+    jobs = []
+    for jid in sorted(os.listdir(jobs_dir))[-15:]:
+        d = read_json(os.path.join(jobs_dir, jid, "job.json"), {})
+        jobs.append({"job_id": jid, "state": d.get("state"), "instance_id": d.get("instance_id")})
+        print("%-40s %-16s instance=%s" % (jid, d.get("state"), d.get("instance_id")))
+    insts = [i for i in list_instances() if is_ours(cfg, i)]
+    result(jobs=jobs, instances=insts)
+    print("\nlive blender-gpu instances on %s: %d" % (PROV.name, len(insts)))
+    for i in insts:
+        print("  %s %s %s $%.3f/hr label=%s" % (i["id"], i["status"], i.get("gpu"),
+                                                 float(i.get("dph_total") or 0), i.get("label")))
+    return 0
+
+
+def instance_age(cfg, inst):
+    rec = read_json(active_path(cfg, inst["id"]), {}) or {}
+    starts = [t for t in (inst.get("started_at"), rec.get("created")) if t]
+    return (now() - min(starts)) if starts else None
+
+
+def cmd_reap(cfg, args):
+    """Independent runtime-limit enforcement, run every few minutes by launchd."""
+    limit = cfg["max_runtime_minutes"] * 60
+    with open(os.path.join(cfg["data_dir"], "logs", "reaper.heartbeat"), "w") as f:
+        f.write(iso())
+    try:
+        insts = list_instances()
+    except Fail as e:
+        reaper_log(cfg, "cannot list instances: %s" % e)
+        return 1
+    live = {str(i["id"]) for i in insts}
+    ours = [i for i in insts if is_ours(cfg, i)]
+    rc = 0
+    destroyed, would = [], []
+    result(destroyed=destroyed, would_destroy=would, checked=[i["id"] for i in ours])
+    for inst in ours:
+        age = instance_age(cfg, inst)  # None: no start time known -> treat as expired
+        if age is not None and age < limit:
+            if args.verbose:
+                print("instance %s age %.0f min (limit %d) ok" % (inst["id"], age / 60, limit // 60))
+            continue
+        msg = "instance %s (%s) age %s min >= limit %d min" % (
+            inst["id"], inst.get("label"), "?" if age is None else "%.0f" % (age / 60), limit // 60)
+        if args.dry_run:
+            print("would destroy " + msg)
+            would.append(inst["id"])
+            continue
+        reaper_log(cfg, "destroying " + msg)
+        if destroy_instance(cfg, inst["id"], "runtime limit", lambda m: reaper_log(cfg, m)):
+            destroyed.append(inst["id"])
+        else:
+            rc = 1
+    # Forget registry entries whose instance no longer exists.
+    adir = os.path.join(cfg["data_dir"], "state", "active")
+    for n in os.listdir(adir):
+        if n.endswith(".json") and n[:-5] not in live and not args.dry_run:
+            os.remove(os.path.join(adir, n))
+    return rc
+
+
+def cmd_panic(cfg, args):
+    insts = list_instances()
+    ours = [i for i in insts if is_ours(cfg, i)]
+    others = [i for i in insts if i not in ours]
+    targets = insts if args.all else ours
+    destroyed = []
+    result(ours=[i["id"] for i in ours], others=[i["id"] for i in others], destroyed=destroyed)
+    print("blender-gpu instances: %s" % ([i["id"] for i in ours] or "none"))
+    if others:
+        print("other instances on the account: %s%s" % ([i["id"] for i in others], "" if args.all else " (left alone; use --all)"))
+    if not targets:
+        result(remaining=[])
+        print("nothing to destroy")
+        return 0
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("refusing without -y in a non-interactive shell")
+            return 2
+        if input("DESTROY %d instance(s) now? Unsaved outputs are lost. [y/N] " % len(targets)).strip().lower() != "y":
+            return 1
+    rc = 0
+    for i in targets:
+        reaper_log(cfg, "panic: destroying %s (%s)" % (i["id"], i.get("label")))
+        if destroy_instance(cfg, i["id"], "panic", lambda m: reaper_log(cfg, m)):
+            destroyed.append(i["id"])
+        else:
+            rc = 1
+    target_ids = {str(i["id"]) for i in targets}
+    left = [i["id"] for i in list_instances() if str(i["id"]) in target_ids or is_ours(cfg, i)]
+    result(remaining=left)
+    print("remaining blender-gpu instances: %s" % (left or "none"))
+    return rc
+
+
+def cmd_install_reaper(cfg, args):
+    plist = os.path.expanduser("~/Library/LaunchAgents/%s.plist" % LAUNCHD_LABEL)
+    py = sys.executable if os.path.isabs(sys.executable) else "/usr/bin/python3"
+    dirs = PROV.path_dirs() + [os.path.expanduser("~/.local/bin")]
+    vdir = ":".join(d for i, d in enumerate(dirs) if d not in dirs[:i])
+    body = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array><string>{py}</string><string>{script}</string><string>reap</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{vdir}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>StartInterval</key><integer>{interval}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{logs}/reaper.out</string>
+  <key>StandardErrorPath</key><string>{logs}/reaper.out</string>
+</dict>
+</plist>
+""".format(label=LAUNCHD_LABEL, py=py, script=os.path.realpath(__file__), vdir=vdir,
+           interval=args.interval, logs=os.path.join(cfg["data_dir"], "logs"))
+    os.makedirs(os.path.dirname(plist), exist_ok=True)
+    with open(plist, "w") as f:
+        f.write(body)
+    subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LAUNCHD_LABEL)], capture_output=True)
+    p = subprocess.run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), plist], capture_output=True, text=True)
+    if p.returncode != 0:
+        raise Fail("launchctl bootstrap failed: %s" % p.stderr)
+    print("installed %s (every %ds)" % (plist, args.interval))
+    return 0
+
+
+def cmd_uninstall_reaper(cfg, args):
+    plist = os.path.expanduser("~/Library/LaunchAgents/%s.plist" % LAUNCHD_LABEL)
+    subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LAUNCHD_LABEL)], capture_output=True)
+    if os.path.exists(plist):
+        os.remove(plist)
+    print("reaper removed")
+    return 0
+
+
+def cmd__onstart(cfg, args):
+    """(internal) print the onstart script for a deadline; used by tests."""
+    sys.stdout.write(onstart_script(args.deadline))
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="blender-gpu", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--json", action="store_true", help="print one JSON result object on stdout")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("doctor")
+    s = sub.add_parser("search")
+    s.add_argument("--disk", type=int)
+    s.add_argument("--limit", type=int, default=20)
+    p = sub.add_parser("plan")
+    p.add_argument("blend")
+    p.add_argument("--project-dir", help="upload this directory (textures, linked libraries) with the .blend")
+    p.add_argument("--frames", help="'1-120', '1,5,10-12', or 'scene' (default: current frame)")
+    p.add_argument("--format", default="PNG", choices=["PNG", "OPEN_EXR", "OPEN_EXR_MULTILAYER", "JPEG", "TIFF", "WEBP"])
+    p.add_argument("--samples", type=int)
+    p.add_argument("--resolution-percent", type=int)
+    p.add_argument("--scene")
+    p.add_argument("--camera")
+    p.add_argument("--device", default="auto", choices=["auto", "OPTIX", "CUDA"])
+    p.add_argument("--mode", default="render", choices=["render", "script"],
+                   help="script: only run --script (it writes to BGPU_OUTPUT_DIR)")
+    p.add_argument("--script", help="Blender Python script run after GPU setup, before rendering")
+    p.add_argument("--output-name", default="frame")
+    p.add_argument("--allow-cpu", action="store_true", help="render on CPU if no GPU backend works (not recommended)")
+    p.add_argument("--allow-missing", action="store_true", help="render even if external files are missing")
+    p.add_argument("--autoexec", action="store_true", help="allow Python drivers/scripts embedded in the .blend")
+    p.add_argument("--disk", type=int)
+    p.add_argument("--max-minutes", type=int, help="lower the runtime limit for this job")
+    p.add_argument("--max-upload-gb", type=float, default=10)
+    r = sub.add_parser("run")
+    r.add_argument("job")
+    r.add_argument("--approve", action="store_true", help="explicit approval to rent a PAID instance")
+    r.add_argument("--detach", action="store_true", help="run in the background, independent of this shell")
+    st = sub.add_parser("status")
+    st.add_argument("job", nargs="?")
+    f = sub.add_parser("fetch")
+    f.add_argument("job")
+    f.add_argument("--destroy", action="store_true", help="destroy the instance after a verified download")
+    d = sub.add_parser("destroy")
+    d.add_argument("job")
+    d.add_argument("-y", "--yes", action="store_true")
+    rp = sub.add_parser("reap")
+    rp.add_argument("--dry-run", action="store_true")
+    rp.add_argument("-v", "--verbose", action="store_true")
+    pn = sub.add_parser("panic")
+    pn.add_argument("-y", "--yes", action="store_true")
+    pn.add_argument("--all", action="store_true", help="destroy EVERY instance on the account")
+    ir = sub.add_parser("install-reaper")
+    ir.add_argument("--interval", type=int, default=300)
+    sub.add_parser("uninstall-reaper")
+    os_ = sub.add_parser("_onstart")
+    os_.add_argument("deadline", type=int)
+    for sp in sub.choices.values():  # allow `blender-gpu plan ... --json` as well
+        sp.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    args = ap.parse_args(argv)
+    real_stdout = sys.stdout
+    if args.json:
+        sys.stdout = sys.stderr  # human-readable progress -> stderr
+    rc = 1
+    try:
+        cfg = load_config()
+        global PROV
+        try:
+            PROV = _Guarded(get_provider(cfg))
+        except ProviderError as e:
+            raise Fail(str(e))
+        fn = globals()["cmd_" + args.cmd.replace("-", "_")]
+        rc = fn(cfg, args)
+    except Fail as e:
+        print("error: %s" % e, file=sys.stderr)
+        RESULT.setdefault("error", str(e))
+        rc = 1
+    finally:
+        if args.json:
+            sys.stdout.flush()
+            sys.stdout = real_stdout
+            out = {"command": args.cmd, "exit_code": rc, "ok": rc == 0}
+            out.update(RESULT)
+            print(json.dumps(out, default=str, sort_keys=True), flush=True)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

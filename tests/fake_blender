@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""Fake `blender` executable for tests: accepts the command lines that
+bootstrap.sh and run_job.sh use and executes the given Python against the fake
+bpy module in tests/fakebpy."""
+import os
+import runpy
+import sys
+
+here = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(here, "fakebpy"))
+args = sys.argv[1:]
+blend = next((a for a in args if a.endswith(".blend")), "")
+os.environ["FAKE_BLEND_PATH"] = blend
+if blend and not os.path.exists(blend):
+    print("Error: Cannot read file '%s': No such file or directory" % blend)
+    sys.exit(1)
+print("Blender 5.2.2 (fake)")
+sys.argv = ["blender"] + args
+if "--python-expr" in args:
+    code = args[args.index("--python-expr") + 1]
+    exec(compile(code, "<expr>", "exec"), {"__name__": "__main__"})
+    sys.exit(0)
+if "--python" in args:
+    script = args[args.index("--python") + 1]
+    runpy.run_path(script, run_name="__main__")
+sys.exit(0)
