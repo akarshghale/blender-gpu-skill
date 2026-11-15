@@ -90,6 +90,40 @@ blender-gpu status JOB --json                # poll every 30-60 s: {"job":{"stat
 - `--max-minutes N` lowers the runtime limit for this job.
 - `--autoexec`, `--allow-missing` and `--allow-cpu`.
 
+## Rendering a scene you built (script mode)
+
+To render a scene you create, write one Blender Python script that builds the
+scene and renders it, then plan it with `plan --mode script --script gen.py`
+(no .blend). Assume nothing exists on this Mac: no Blender, no `bpy`, no
+assets. Never install or run Blender locally. The script must be
+self-contained and work on its first GPU run. Only `python3 -m py_compile
+gen.py` (syntax) can be checked locally.
+
+In script mode the tool renders nothing itself. The script must:
+
+- Build in `bpy.context.scene`. Only that scene has the GPU set up. A scene
+  from `bpy.data.scenes.new()` renders on the CPU at GPU prices unless the
+  script sets `scene.cycles.device = "GPU"` and makes it the active scene.
+- Delete the default cube, camera and light first if it does not want them.
+- Set a camera (`scene.camera`) and lighting, or the render is empty or black.
+- Call the render: `bpy.ops.render.render(write_still=True)` for one image, or
+  set `frame_start`/`frame_end` and use `animation=True`. `--frames` is ignored.
+- Write every result into `BGPU_OUTPUT_DIR` (for example
+  `scene.render.filepath = os.path.join(BGPU_OUTPUT_DIR, "frame_####")`).
+  Anything else is lost when the instance is destroyed.
+- Also save the built scene with
+  `bpy.ops.wm.save_as_mainfile(filepath=os.path.join(BGPU_OUTPUT_DIR, "scene.blend"))`,
+  so later re-renders can run as normal render jobs without rebuilding.
+- Set samples, resolution and format in the script. The `plan` flags only reach
+  `bpy.context.scene`, before the script runs.
+- Use only built-in Blender features and the files it is given. The instance
+  cannot reach this Mac. Upload assets with `--project-dir DIR`; the script
+  finds them under `os.path.dirname(os.path.dirname(__file__))`.
+
+A script error marks the job `failed` (traceback in `logs/remote/blender.log`)
+and still costs the rental time used. For a long or expensive render, offer the
+user a short, low-sample preview job first; it needs its own plan and yes.
+
 Always use `--detach` for `run`. The job and its cleanup then survive your
 process or session ending. Poll `status JOB --json` until `job.state` reaches
 a terminal state:
