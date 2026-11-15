@@ -251,6 +251,30 @@ class TestJobLifecycle(Base):
         self.assertEqual(rc, 0, out)
         self.assertEqual(json.load(open(os.path.join(self.data, "jobs", job, "output", "stats.json"))), {"device": "OPTIX"})
 
+    def test_script_mode_without_blend(self):
+        script = os.path.join(self.tmp, "gen_scene.py")
+        open(script, "w").write("import os\nopen(os.path.join(BGPU_OUTPUT_DIR,'blend.txt'),'w')"
+                                ".write(os.environ.get('FAKE_BLEND_PATH','?') or 'none')\n")
+        rc, out = self.cli("plan", "--mode", "script", "--script", script)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("none (Blender's default scene)", out)
+        job = [l.split()[1] for l in out.splitlines() if l.startswith("JOB ")][0]
+        self.assertTrue(job.endswith("-gen-scene"), job)
+        self.assertEqual(list(self.job(job)["inputs"]), ["_extra/gen_scene.py"])
+        rc, out = self.cli("run", job, "--approve")
+        self.assertEqual(rc, 0, out)
+        # Blender was started with no file argument.
+        self.assertEqual(open(os.path.join(self.data, "jobs", job, "output", "blend.txt")).read(), "none")
+
+    def test_blend_required_outside_script_mode(self):
+        script = os.path.join(self.tmp, "make.py")
+        open(script, "w").write("pass\n")
+        for args in ([], ["--frames", "1-3"], ["--script", script], ["--mode", "script"]):
+            rc, out = self.cli("plan", *args)
+            self.assertNotEqual(rc, 0, args)
+            self.assertIn("a .blend is required", out)
+        self.assertEqual(self.calls("create instance"), [])
+
 
 class TestRuntimeLimit(Base):
     def put_instances(self, insts):
