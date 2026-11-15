@@ -11,10 +11,12 @@ echo running > "$J/state"
 rm -f "$J/exit_code" "$J/MANIFEST.sha256"
 
 BL=$(cat "$B/status/blender_bin")
-BLEND=$J/input/$(cat "$J/blend_rel")
+REL=$(cat "$J/blend_rel" 2>/dev/null)
 ARGS=(-b --factory-startup)
 [ -f "$J/autoexec" ] && ARGS+=(-y)
-ARGS+=("$BLEND" --python-exit-code 7 --python "$B/render.py" -- "$J/spec.json")
+# Script-only jobs may have no .blend: Blender then starts with its default scene.
+[ -n "$REL" ] && ARGS+=("$J/input/$REL")
+ARGS+=(--python-exit-code 7 --python "$B/render.py" -- "$J/spec.json")
 
 TO=$(command -v timeout || true)
 if [ -n "$TO" ]; then

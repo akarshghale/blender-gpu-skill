@@ -52,7 +52,8 @@ open ~/BlenderGPU/jobs/<JOB>/output
 
 `plan` options: `--frames 1-10,15|scene`, `--format PNG|OPEN_EXR|OPEN_EXR_MULTILAYER|JPEG|TIFF|WEBP`,
 `--samples N`, `--resolution-percent N`, `--scene`, `--camera`, `--device auto|OPTIX|CUDA`,
-`--mode script --script gen.py` (Blender Python; write files to `BGPU_OUTPUT_DIR`),
+`--mode script --script gen.py` (Blender Python; write files to `BGPU_OUTPUT_DIR`; the .blend is
+then optional and Blender starts with its default scene),
 `--project-dir DIR` (textures and linked libraries), `--max-minutes N`, `--autoexec`,
 `--allow-missing`, `--allow-cpu`.
 

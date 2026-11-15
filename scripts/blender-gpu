@@ -286,7 +286,8 @@ EXCLUDE_RE = re.compile(r"(\.blend\d+$|^\._|^\.DS_Store$)")
 
 
 def collect_inputs(blend, project_dir, extra):
-    """Return {relative_path: absolute_path} for upload."""
+    """Return {relative_path: absolute_path} for upload. blend may be None
+    (script mode): rel_blend is then "" and Blender starts with its default scene."""
     files = {}
     if project_dir:
         for root, dirs, names in os.walk(project_dir):
@@ -296,9 +297,11 @@ def collect_inputs(blend, project_dir, extra):
                     continue
                 full = os.path.join(root, n)
                 files[os.path.relpath(full, project_dir)] = full
-        rel_blend = os.path.relpath(blend, project_dir)
+        rel_blend = os.path.relpath(blend, project_dir) if blend else ""
         if rel_blend.startswith(".."):
             raise Fail("the .blend must be inside --project-dir")
+    elif not blend:
+        rel_blend = ""
     else:
         rel_blend = os.path.basename(blend)
         files[rel_blend] = blend
@@ -495,13 +498,18 @@ def cmd_search(cfg, args):
 
 
 def cmd_plan(cfg, args):
-    blend = os.path.abspath(os.path.expanduser(args.blend))
-    if not os.path.isfile(blend) or not blend.endswith(".blend"):
-        raise Fail("not a .blend file: %s" % blend)
-    with open(blend, "rb") as f:
-        head = f.read(12)
-    if not (head.startswith(b"BLENDER") or head[:2] == b"\x1f\x8b" or head[:4] == b"\x28\xb5\x2f\xfd"):
-        raise Fail("%s does not look like a Blender file" % blend)
+    if args.blend:
+        blend = os.path.abspath(os.path.expanduser(args.blend))
+        if not os.path.isfile(blend) or not blend.endswith(".blend"):
+            raise Fail("not a .blend file: %s" % blend)
+        with open(blend, "rb") as f:
+            head = f.read(12)
+        if not (head.startswith(b"BLENDER") or head[:2] == b"\x1f\x8b" or head[:4] == b"\x28\xb5\x2f\xfd"):
+            raise Fail("%s does not look like a Blender file" % blend)
+    elif args.mode != "script" or not args.script:
+        raise Fail("a .blend is required unless you pass --mode script --script FILE.py")
+    else:
+        blend = None
     project = os.path.abspath(os.path.expanduser(args.project_dir)) if args.project_dir else None
     extra = []
     if args.script:
@@ -515,7 +523,7 @@ def cmd_plan(cfg, args):
     disk = args.disk or max(cfg["disk_gb"], int(total * 3 / 1e9) + 12)
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", os.path.splitext(os.path.basename(blend))[0]).strip("-")[:24] or "job"
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", os.path.splitext(os.path.basename(blend or extra[0]))[0]).strip("-")[:24] or "job"
     job_id = "%s-%s" % (stamp, slug)
     jdir = os.path.join(cfg["data_dir"], "jobs", job_id)
     os.makedirs(os.path.join(jdir, "logs"))
@@ -547,7 +555,9 @@ def cmd_plan(cfg, args):
            run_command="blender-gpu run %s --approve --detach" % job_id)
 
     print("JOB %s" % job_id)
-    print("  blend      %s%s" % (blend, ("  (project dir %s)" % project) if project else ""))
+    print("  blend      %s%s" % (blend or "none (Blender's default scene)", ("  (project dir %s)" % project) if project else ""))
+    if args.script:
+        print("  script     %s" % extra[0])
     print("  upload     %d file(s), %.1f MB   disk %d GB" % (len(files), total / 1e6, disk))
     print("  render     mode=%s frames=%s format=%s device=%s%s" % (
         args.mode, args.frames or "current", args.format, args.device, " samples=%s" % args.samples if args.samples else ""))
@@ -865,7 +875,7 @@ def approval_text(cfg, job):
                     (" (or %d fallback offer(s) up to $%.4f/hr)" % (len(c) - 1, max(x["dph_total"] for x in c)))
                     if len(c) > 1 else "",
                     d["max_runtime_minutes"], d["worst_case_cost"],
-                    os.path.basename(d["blend"])))
+                    os.path.basename(d["blend"] or (d["spec"].get("user_script") or "script"))))
 
 
 def _ask_dialog(text):
@@ -1252,7 +1262,7 @@ def main(argv=None):
     s.add_argument("--disk", type=int)
     s.add_argument("--limit", type=int, default=20)
     p = sub.add_parser("plan")
-    p.add_argument("blend")
+    p.add_argument("blend", nargs="?", help=".blend file (optional with --mode script --script FILE.py)")
     p.add_argument("--project-dir", help="upload this directory (textures, linked libraries) with the .blend")
     p.add_argument("--frames", help="'1-120', '1,5,10-12', or 'scene' (default: current frame)")
     p.add_argument("--format", default="PNG", choices=["PNG", "OPEN_EXR", "OPEN_EXR_MULTILAYER", "JPEG", "TIFF", "WEBP"])

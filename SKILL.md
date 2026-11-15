@@ -83,7 +83,9 @@ blender-gpu status JOB --json                # poll every 30-60 s: {"job":{"stat
 - `--scene` and `--camera`
 - `--device auto|OPTIX|CUDA`
 - `--script gen.py` runs Blender Python before rendering. Add `--mode script`
-  to run only the script, which writes its files to `BGPU_OUTPUT_DIR`.
+  to run only the script, which writes its files to `BGPU_OUTPUT_DIR`. In
+  script mode the .blend is optional: `blender-gpu plan --mode script --script
+  gen.py` starts Blender with its default scene.
 - `--project-dir DIR` uploads textures and linked libraries with the .blend.
 - `--max-minutes N` lowers the runtime limit for this job.
 - `--autoexec`, `--allow-missing` and `--allow-cpu`.
